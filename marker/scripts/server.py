@@ -3,7 +3,7 @@ import traceback
 import click
 import os
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from starlette.responses import HTMLResponse
 
 from marker.config.parser import ConfigParser
@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Annotated
 import io
 
-from fastapi import FastAPI, Form, File, UploadFile
+from fastapi import FastAPI, Form, File, UploadFile, Request
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.settings import settings
@@ -53,6 +53,8 @@ async def root():
 
 
 class CommonParams(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     filepath: Annotated[
         Optional[str], Field(description="The path to the PDF file to convert.")
     ]
@@ -78,9 +80,15 @@ class CommonParams(BaseModel):
     output_format: Annotated[
         str,
         Field(
-            description="The format to output the text in.  Can be 'markdown', 'json', or 'html'.  Defaults to 'markdown'."
+            description="The format to output the text in.  Can be 'markdown', 'json', or 'html', or 'chunks'.  Defaults to 'markdown'."
         ),
     ] = "markdown"
+    use_llm: Annotated[
+        bool,
+        Field(
+            description="Whether to use an LLM-backed postprocessing pipeline (hybrid mode) for improved accuracy."
+        ),
+    ] = False
 
 
 async def _convert_pdf(params: CommonParams):
@@ -134,6 +142,7 @@ async def convert_pdf(params: CommonParams):
 
 @app.post("/marker/upload")
 async def convert_pdf_upload(
+    request: Request,
     page_range: Optional[str] = Form(default=None),
     force_ocr: Optional[bool] = Form(default=False),
     paginate_output: Optional[bool] = Form(default=False),
@@ -147,13 +156,17 @@ async def convert_pdf_upload(
         file_contents = await file.read()
         upload_file.write(file_contents)
 
-    params = CommonParams(
-        filepath=upload_path,
-        page_range=page_range,
-        force_ocr=force_ocr,
-        paginate_output=paginate_output,
-        output_format=output_format,
+    form_data = dict(await request.form())
+    form_data.update(
+        {
+            "filepath": upload_path,
+            "page_range": page_range,
+            "force_ocr": force_ocr,
+            "paginate_output": paginate_output,
+            "output_format": output_format,
+        }
     )
+    params = CommonParams(**form_data)
     results = await _convert_pdf(params)
     os.remove(upload_path)
     return results
