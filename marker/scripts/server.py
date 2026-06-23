@@ -175,12 +175,28 @@ async def convert_pdf_upload(
 @click.command()
 @click.option("--port", type=int, default=8000, help="Port to run the server on")
 @click.option("--host", type=str, default="127.0.0.1", help="Host to run the server on")
-def server_cli(port: int, host: str):
+@click.option(
+    "--workers",
+    type=int,
+    default=1,
+    help="Number of worker processes. Each worker loads its own copy of the models, "
+    "so memory/VRAM usage scales with the worker count.",
+)
+def server_cli(port: int, host: str, workers: int):
     import uvicorn
 
-    # Run the server
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-    )
+    # Run the server. With workers > 1 uvicorn needs an import string (not the app
+    # object) so it can spawn the app in each worker process.
+    if workers > 1:
+        uvicorn.run(
+            "marker.scripts.server:app",
+            host=host,
+            port=port,
+            workers=workers,
+        )
+    else:
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+        )
