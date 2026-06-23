@@ -2,6 +2,7 @@ import traceback
 
 import click
 import os
+import uuid
 
 from pydantic import BaseModel, Field, ConfigDict
 from starlette.responses import HTMLResponse
@@ -50,6 +51,15 @@ async def root():
 </ul>
 """
     )
+
+
+@app.get("/health")
+async def health():
+    # Lightweight liveness probe. FastAPI only starts serving after the lifespan
+    # startup completes, so reaching this endpoint already implies the models are
+    # loaded. Through the proxy this also serves as an end-to-end check (proxy up
+    # and a backend responsive).
+    return {"status": "ok"}
 
 
 class CommonParams(BaseModel):
@@ -151,24 +161,36 @@ async def convert_pdf_upload(
         ..., description="The PDF file to convert.", media_type="application/pdf"
     ),
 ):
-    upload_path = os.path.join(UPLOAD_DIRECTORY, file.filename)
+    # Prefix a unique id so concurrent uploads never collide on disk. Multiple
+    # server processes can share this directory (e.g. one marker_server per GPU
+    # behind a proxy), and two clients may upload files with the same name; with
+    # a shared fixed path one request would delete the file another is still
+    # using, which previously surfaced as a 500 (FileNotFoundError on cleanup).
+    safe_name = os.path.basename(file.filename or "upload.pdf")
+    upload_path = os.path.join(UPLOAD_DIRECTORY, f"{uuid.uuid4().hex}_{safe_name}")
     with open(upload_path, "wb+") as upload_file:
         file_contents = await file.read()
         upload_file.write(file_contents)
 
-    form_data = dict(await request.form())
-    form_data.update(
-        {
-            "filepath": upload_path,
-            "page_range": page_range,
-            "force_ocr": force_ocr,
-            "paginate_output": paginate_output,
-            "output_format": output_format,
-        }
-    )
-    params = CommonParams(**form_data)
-    results = await _convert_pdf(params)
-    os.remove(upload_path)
+    try:
+        form_data = dict(await request.form())
+        form_data.update(
+            {
+                "filepath": upload_path,
+                "page_range": page_range,
+                "force_ocr": force_ocr,
+                "paginate_output": paginate_output,
+                "output_format": output_format,
+            }
+        )
+        params = CommonParams(**form_data)
+        results = await _convert_pdf(params)
+    finally:
+        # Best-effort cleanup; never fail the request if the temp file is gone.
+        try:
+            os.remove(upload_path)
+        except FileNotFoundError:
+            pass
     return results
 
 
