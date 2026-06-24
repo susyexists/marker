@@ -41,8 +41,21 @@ def build_app(backends, timeout):
     async def lifespan(app):
         # One shared client. read=None: a single PDF conversion can run for
         # minutes, so we must not impose a read timeout on the backend response.
+        #
+        # Pool limits: with WORKERS_PER_DEVICE backends per GPU we keep many
+        # conversions in flight at once. httpx's defaults (max_keepalive=20,
+        # keepalive_expiry=5s) would tear down warm localhost sockets every few
+        # seconds under bursty load and cap concurrent connections too low. Raise
+        # both so every backend keeps a warm pooled socket and bursts don't queue
+        # on the connection pool.
         app.state.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout, read=None), follow_redirects=False
+            timeout=httpx.Timeout(timeout, read=None),
+            follow_redirects=False,
+            limits=httpx.Limits(
+                max_connections=256,
+                max_keepalive_connections=64,
+                keepalive_expiry=120.0,
+            ),
         )
         yield
         await app.state.client.aclose()
@@ -124,13 +137,20 @@ def main():
         help="Backend base URLs, e.g. http://127.0.0.1:8001 http://127.0.0.1:8002",
     )
     parser.add_argument(
-        "--timeout", type=float, default=30.0,
-        help="Connect/write timeout (s) to backends; response read has no timeout.",
+        "--timeout", type=float, default=60.0,
+        help="Connect/write timeout (s) to backends; response read has no timeout. "
+        "This only bounds establishing the connection and sending the request — a "
+        "busy backend still accepts the connection immediately (uvicorn accepts "
+        "before the blocking handler runs), so this does NOT gate a request waiting "
+        "behind in-progress conversions.",
     )
     args = parser.parse_args()
 
     app = build_app(args.backends, args.timeout)
-    uvicorn.run(app, host=args.host, port=args.port)
+    # timeout_keep_alive: keep idle client<->proxy connections alive for 120s so a
+    # conversion that runs for minutes doesn't get its TCP connection reaped between
+    # request and response (default uvicorn keep-alive is only 5s).
+    uvicorn.run(app, host=args.host, port=args.port, timeout_keep_alive=120)
 
 
 if __name__ == "__main__":

@@ -207,6 +207,19 @@ async def convert_pdf_upload(
 def server_cli(port: int, host: str, workers: int):
     import uvicorn
 
+    # Cap torch intra-op threads when set. run_server.sh launches many single-worker
+    # backends per node; without a cap each torch process would grab all CPU cores,
+    # and N backends * all-cores oversubscribes the CPU and slows every conversion.
+    # (BLAS/pdftext threads are capped via OMP/MKL env vars set by run_server.sh.)
+    torch_threads = os.environ.get("MARKER_TORCH_THREADS")
+    if torch_threads:
+        try:
+            import torch
+
+            torch.set_num_threads(max(1, int(torch_threads)))
+        except Exception:
+            pass
+
     # Run the server. With workers > 1 uvicorn needs an import string (not the app
     # object) so it can spawn the app in each worker process.
     if workers > 1:
@@ -217,8 +230,13 @@ def server_cli(port: int, host: str, workers: int):
             workers=workers,
         )
     else:
+        # timeout_keep_alive=120: a single conversion can run for minutes; keep the
+        # idle keep-alive window well above that so the proxy<->backend connection
+        # isn't reaped between request and response (default is 5s). This is the
+        # branch run_server.sh uses (always --workers 1 per backend).
         uvicorn.run(
             app,
             host=host,
             port=port,
+            timeout_keep_alive=120,
         )

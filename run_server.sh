@@ -19,9 +19,11 @@
 #      per GPU + the front proxy.
 #
 # Usage:
-#   ./run_server.sh                      # proxy on 127.0.0.1:8000, WORKERS_PER_DEVICE backends per GPU
+#   ./run_server.sh                      # proxy on 127.0.0.1:7000, WORKERS_PER_DEVICE backends per GPU
 #   HOST=0.0.0.0 PORT=8080 ./run_server.sh
 #   NUM_DEVICES=2 ./run_server.sh        # use only the first 2 GPUs
+#   CUDA_VISIBLE_DEVICES=1 ./run_server.sh   # use only physical GPU 1
+#   CUDA_VISIBLE_DEVICES=2,3 ./run_server.sh # use physical GPUs 2 and 3
 #   WORKERS_PER_DEVICE=2 ./run_server.sh # 2 single-worker servers per GPU (2x model VRAM/GPU)
 #   TORCH_DEVICE=cpu ./run_server.sh     # force CPU
 #   ENV_FILE=.env ./run_server.sh        # read a different env file
@@ -35,7 +37,7 @@ cd "$(dirname "$0")"
 #    `:=` only assigns when the var is unset/empty, so real env vars win.
 # ---------------------------------------------------------------------------
 : "${HOST:=127.0.0.1}"           # interface the public proxy binds to
-: "${PORT:=8000}"                # port the public proxy listens on
+: "${PORT:=7000}"                # port the public proxy listens on
 : "${WORKERS_PER_DEVICE:=1}"     # single-worker server processes per device (N x model VRAM per device)
 : "${NUM_DEVICES:=}"             # GPUs to use; empty = auto-detect all visible GPUs
 : "${BACKEND_HOST:=127.0.0.1}"   # interface the per-backend servers bind to (kept private)
@@ -76,6 +78,14 @@ else
   unset TORCH_DEVICE
 fi
 
+# CUDA_VISIBLE_DEVICES selects which physical GPU(s) to use (e.g. "1" or "2,3").
+# Capture that selection, then clear the global mask: this lets torch detection
+# below see and validate every GPU, and lets each backend be pinned to a real
+# physical index (the per-backend CUDA_VISIBLE_DEVICES we set later is read by a
+# fresh process, so it must be an absolute index, not a mask-relative one).
+SELECTED_GPUS="${CUDA_VISIBLE_DEVICES:-}"
+unset CUDA_VISIBLE_DEVICES
+
 # ---------------------------------------------------------------------------
 # 3. Figure out how many GPUs we can actually use. torch is authoritative here:
 #    a node can have GPUs that the installed torch build can't initialize (e.g.
@@ -96,13 +106,33 @@ case "${TORCH_DEVICE:-}" in
   cpu|mps|cuda:*) FORCE_SINGLE=1 ;;  # cuda:N already pins one device
 esac
 
+# Resolve the list of physical GPU indices to use. An explicit CUDA_VISIBLE_DEVICES
+# selection wins; otherwise use every GPU torch can see (0..TORCH_NGPU-1).
+gpu_indices=()
+if [[ -n "$SELECTED_GPUS" ]]; then
+  IFS=',' read -r -a requested <<< "$SELECTED_GPUS"
+  for idx in "${requested[@]}"; do
+    idx="${idx//[[:space:]]/}"
+    if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx < TORCH_NGPU )); then
+      gpu_indices+=("$idx")
+    else
+      echo "[run_server] WARNING: ignoring requested GPU '${idx}' — torch sees ${TORCH_NGPU} GPU(s)"
+    fi
+  done
+else
+  for (( g = 0; g < TORCH_NGPU; g++ )); do
+    gpu_indices+=("$g")
+  done
+fi
+
+# NUM_DEVICES caps how many of the selected GPUs to use (unset = all of them).
 if [[ -z "${NUM_DEVICES:-}" ]]; then
-  NUM_DEVICES="$TORCH_NGPU"
+  NUM_DEVICES="${#gpu_indices[@]}"
 fi
-# Never ask for more GPUs than torch can see.
-if (( NUM_DEVICES > TORCH_NGPU )); then
-  NUM_DEVICES="$TORCH_NGPU"
+if (( NUM_DEVICES > ${#gpu_indices[@]} )); then
+  NUM_DEVICES="${#gpu_indices[@]}"
 fi
+gpu_indices=("${gpu_indices[@]:0:NUM_DEVICES}")
 
 # ---------------------------------------------------------------------------
 # 4. Build the backend list. backend_gpu[i] is the GPU index to pin backend i
@@ -114,7 +144,7 @@ if [[ "$CUDA_OK" == "1" && "$FORCE_SINGLE" != "1" && "$NUM_DEVICES" -ge 1 ]]; th
   USE_GPU=1
   for (( g = 0; g < NUM_DEVICES; g++ )); do
     for (( w = 0; w < WORKERS_PER_DEVICE; w++ )); do
-      backend_gpu+=("$g")
+      backend_gpu+=("${gpu_indices[$g]}")
     done
   done
 else
@@ -129,6 +159,28 @@ else
 fi
 
 TOTAL=${#backend_gpu[@]}
+
+# ---------------------------------------------------------------------------
+# 4a-pre. Cap CPU threads per backend. Each backend is a full process; with
+# TOTAL of them, letting every one grab all cores oversubscribes the CPU and
+# slows every conversion (BLAS/pdftext/torch all spin up thread pools). Mirror
+# the batch path (convert.py): pin BLAS pools to 2 and split physical cores
+# across backends for torch's intra-op pool. Exported here so every backend
+# (single-process fast path and multi-backend path) inherits it.
+PHYS_CORES=$(python - <<'PY'
+try:
+    import psutil
+    print(psutil.cpu_count(logical=False) or 1)
+except Exception:
+    import os
+    print(os.cpu_count() or 1)
+PY
+)
+TORCH_THREADS=$(( PHYS_CORES / TOTAL ))
+(( TORCH_THREADS < 2 )) && TORCH_THREADS=2
+export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
+export MARKER_TORCH_THREADS="$TORCH_THREADS"
+echo "[run_server] CPU threads/backend: OMP=2 torch=${TORCH_THREADS} (phys_cores=${PHYS_CORES}, backends=${TOTAL})"
 
 if command -v marker_server >/dev/null 2>&1; then
   SERVER_CMD=(marker_server)

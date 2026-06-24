@@ -18,7 +18,7 @@ cd "$(dirname "$0")"
 
 # --- activate the venv that has BOTH marker AND the marker-worker installed ---
 #   pip install -e /path/to/llm-fabric/shared -e /path/to/llm-fabric/services/marker_worker
-source /work/10417/susy/ls6/AI/vllm/.venv/bin/activate
+#source /work/10417/susy/ls6/AI/vllm/.venv/bin/activate
 
 # --- TLS / proxy env (same as the vLLM worker box) ---
 export SSL_CERT_FILE=$(python -c 'import certifi; print(certifi.where())')
@@ -33,7 +33,13 @@ export NATS_URL=${NATS_URL:-wss://nats.materials.wiki:8443}
 
 # --- marker-worker identity / behavior ---
 export WORKER_ID=${WORKER_ID:-marker-$(hostname)}
-export MARKER_CONCURRENCY=${MARKER_CONCURRENCY:-1}      # Marker is GPU-serial; 1 per worker
+# run_server.sh runs NUM_DEVICES * WORKERS_PER_DEVICE single-worker backends behind
+# marker_lb.py (here: 2 GPUs * 8 = 16). Each backend is GPU-serial, but the fleet
+# is not — push 16 conversions concurrently so the least-connections proxy keeps
+# every backend busy (1 marker-worker suffices; run_conversion is fully async, the
+# semaphore is the only cap). Match this to the actual backend count if you change
+# WORKERS_PER_DEVICE / NUM_DEVICES.
+export MARKER_CONCURRENCY=${MARKER_CONCURRENCY:-16}
 export MARKER_HTTP_TIMEOUT_SECONDS=${MARKER_HTTP_TIMEOUT_SECONDS:-6000}
 export PROGRESS_INTERVAL_SECONDS=${PROGRESS_INTERVAL_SECONDS:-30}
 # This script does the single readiness wait below, so the worker's own probe is
